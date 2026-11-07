@@ -1,4 +1,4 @@
-"""最小多轮助手：在当前进程内保存对话历史。"""
+"""最小多轮助手，支持工具调用和本地会话历史。"""
 
 import json
 import os
@@ -48,7 +48,7 @@ def call_llm(messages: list[dict]) -> dict:
     return message
 
 
-def execute_tool(tool_call: dict) -> str:
+def execute_tool(tool_call: dict, session_id: str) -> str:
     """按模型给出的工具名查找函数，并传入解析后的参数。"""
     function = tool_call["function"]
     registered_tool = AGENT_TOOLS.get(function["name"])
@@ -63,16 +63,20 @@ def execute_tool(tool_call: dict) -> str:
 
     if not isinstance(arguments, dict):
         return "错误：工具参数必须是 JSON 对象。"
+    if "session_id" in arguments:
+        return "错误：工具参数不能指定 session_id。"
 
     try:
-        return str(handler(**arguments))
+        return str(handler(session_id, **arguments))
     except TypeError:
         return "错误：工具参数与函数签名不匹配。"
     except ValueError as exc:
         return f"错误：{exc}"
+    except sqlite3.Error:
+        return "错误：无法读取或保存待办。"
 
 
-def run_agent(user_input: str, messages: list[dict]) -> str:
+def run_agent(user_input: str, messages: list[dict], session_id: str) -> str:
     # 本轮的用户消息、工具调用和工具结果先放在临时列表里。
     turn = [{"role": "user", "content": user_input}]
 
@@ -97,7 +101,7 @@ def run_agent(user_input: str, messages: list[dict]) -> str:
             turn.append({
                 "role": "tool",
                 "tool_call_id": tool_call["id"],
-                "content": execute_tool(tool_call),
+                "content": execute_tool(tool_call, session_id),
             })
 
     raise ValueError("已达到本轮的模型调用上限，未获得最终回答。")
@@ -136,7 +140,7 @@ def main() -> int:
                 messages[0] = system_message
             else:
                 messages = [system_message, *(messages or [])]
-            message = run_agent(user_input, messages)
+            message = run_agent(user_input, messages, session_id)
             save_messages(session_id, messages)
             print(f"助手：{message}")
         except sqlite3.Error as exc:
