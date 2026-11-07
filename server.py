@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 
 from agent.assistant import ASSISTANT
+from context_manager import build_context
 from session_store import init_db, load_messages, save_messages
 from tool.registry import TOOLS
 
@@ -81,7 +82,7 @@ def run_agent(user_input: str, messages: list[dict], session_id: str) -> str:
     turn = [{"role": "user", "content": user_input}]
 
     for _ in range(MAX_MODEL_CALLS):
-        message = call_llm([*messages, *turn])
+        message = call_llm(build_context(messages, turn))
         tool_calls = message.get("tool_calls")
         content = message.get("content")
 
