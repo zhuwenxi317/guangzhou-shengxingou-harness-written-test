@@ -31,6 +31,31 @@ def init_db() -> None:
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS todos_by_session ON todos(session_id)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS session_summaries (
+                session_id TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_id),
+                summary TEXT NOT NULL,
+                covered_messages INTEGER NOT NULL
+            )
+        """)
+
+
+def load_summary(session_id: str) -> tuple[str, int]:
+    with closing(connect_db()) as db:
+        row = db.execute(
+            "SELECT summary, covered_messages FROM session_summaries WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return row if row is not None else ("", 0)
+
+
+def save_summary(session_id: str, summary: str, covered_messages: int) -> None:
+    with closing(connect_db()) as db, db:
+        db.execute("""
+            INSERT INTO session_summaries (session_id, summary, covered_messages) VALUES (?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                summary = excluded.summary, covered_messages = excluded.covered_messages
+        """, (session_id, summary, covered_messages))
 
 
 def load_messages(session_id: str) -> list[dict] | None:
