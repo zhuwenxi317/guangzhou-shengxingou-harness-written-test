@@ -1,55 +1,54 @@
-# 最小 Agent：本地会话与工具调用
+# 最小 Agent Runtime
 
-当前实现多轮文本对话：用户输入 → 携带历史 messages 请求模型 → 提取 message.content → 保存本轮问答 → 等待下一次输入。
-输入 `exit`、`quit` 或按 Ctrl+C 退出。成功完成的问答和工具消息保存到项目目录下的 `sessions.sqlite3`，该文件已被 Git 忽略。
-输入 `/session <ID>` 切换会话，例如 `/session window-1`。重启后切回相同 ID，下一次提问时会从数据库加载它的历史。默认 ID 是 `default`。
-每个会话有独立的历史。每轮提问前，程序用 JSON 字符数估算系统提示词、已有摘要、尚未压缩的历史和当前问题的长度。超过 12,000 字符才尝试调用 LLM 压缩旧历史，优先保留最近五轮原文。工具调用和结果随所属轮次一起处理。摘要放在系统提示词之后、历史原文之前，摘要和进度按会话保存，SQLite 也继续保存完整历史。字符阈值是触发条件，不能保证符合所有模型的 token 上限。请用单个 CLI 进程操作数据库，同一个 ID 的并发写入可能覆盖历史。
+一个用 Python 自行实现的命令行 Agent，支持工具调用、独立会话、历史摘要和 SQLite 执行日志。模型服务使用 OpenAI 兼容的 Chat Completions 接口。
 
 ## 运行
 
-在 PowerShell 中执行：
+需要 Python 3.11 或更高版本，以及支持工具调用的模型。在项目根目录打开 PowerShell：
 
 ```powershell
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe server.py
+Copy-Item .env.example .env
 ```
 
-首次运行前编辑本地 `.env`：
+已有虚拟环境或 `.env` 时跳过对应的创建命令。编辑本地 `.env`，填写 `LLM_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL`。基础地址使用服务商提供的地址，通常以 `/v1` 结尾，程序会自行拼接 `/chat/completions`。
 
-- `LLM_API_KEY`：你的 API 密钥。
-- `LLM_BASE_URL`：服务商提供的 OpenAI 兼容接口基础地址，通常以 `/v1` 结尾；不要包含 `/chat/completions`。
-- `LLM_MODEL`：服务商提供的模型 ID。
+```powershell
+.\.venv\Scripts\python.exe server.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
-程序会向 `LLM_BASE_URL/chat/completions` 发送请求，使用系统消息、历史问答与本次用户消息，不开启流式输出。
-`.env` 和 `.venv` 已加入 Git 忽略规则；提交 `.env.example` 说明配置项。不要提交密钥。
+单元测试使用模拟模型和临时数据库，无需 API Key。密钥文件和本地数据库已加入 Git 忽略规则。
 
-## 代码入口
+试运行时可以先输入「搜一下项目启动命令」，再输入「把刚才的命令添加到待办」。用 `/session window-2` 切换会话，重启后用相同 ID 继续。默认会话为 `default`，输入 `exit`、`quit` 或按 Ctrl+C 退出。
 
-- `main()`：加载环境配置，循环接收输入，按当前 ID 加载历史并在回答成功后保存。
-- `session_store.py`：SQLite 存储模块，以会话 ID 为主键，每个会话保存一份 JSON 消息列表。
-- `run_agent()`：携带当前会话历史请求模型，执行工具，获得最终回复后保存整轮消息。
-- `call_llm()`：向模型发送消息和工具 Schema，返回完整的 assistant 消息。
+## 系统设计
 
-## 开发记录
+- `server.py` 负责 CLI、模型请求与工具循环。模型返回 `tool_calls` 时，Runtime 校验参数、执行工具，再将带有对应 `tool_call_id` 的结果交回模型。没有工具调用且有有效文本时返回最终回答。每轮回答最多请求模型五次，摘要请求单独计算。
+- `tool/registry.py` 将工具名映射到参数 Schema 和本地函数。`agent/assistant.py` 指定装载名单。当前提供乘法计算器、会话待办和本地模拟搜索。待办的会话 ID 由 Runtime 注入。
+- `session_store.py` 用 SQLite 保存会话历史、摘要、待办和日志。完整问答成功后写入聊天历史。待办和执行日志在各自操作完成时写入。CLI 按单进程使用设计。
+- `call_llm()` 识别可选的 `reasoning_content`。调试日志只记录字段长度，推理正文不会回传模型、持久化或进入跨轮记忆。工具决策依据 `tool_calls`，用户答案取 `content`。
 
-1. 用户要求：先搭建最简单的单轮调用，提取模型 message 作为输出，使用 `.env` 配置密钥，并用 Git 记录每个开发阶段。
-2. 实现选择：入口暂时集中在 `server.py`，使用标准库 HTTP 客户端与 python-dotenv；等加入工具时再拆分 Runtime 与 Agent 配置。
-3. 验证边界：终端环境启动故障，尚未完成模拟接口测试与真实模型调用验证。
-4. 用户要求增加连续提问与进程内上下文：历史按 user / assistant 角色放入 messages，每轮重发，退出即清空。终端环境启动故障使本次自动验证与 Git 提交暂未完成。
-5. 用户要求跨进程恢复会话：将会话历史移至 SQLite，沿用 `/session <ID>` 选择历史。
-6. 将计算器加入 `tool/registry.py`。模型请求从注册表读取 Schema，执行时按工具名查找 Python 函数。
-7. 在 `agent/assistant.py` 集中定义系统提示词和工具名单。发送 Schema 和执行工具都受该名单约束，技能列表暂为空。
-8. 注册并装载 `todo`。在当前会话输入「帮我添加待办：周五交笔试」或「查看我的待办」。待办存入同一个 SQLite 文件的 `todos` 表，按当前 `session_id` 查询。添加成功时立即写入，因此后续模型回复失败也不会撤销待办。
-9. `context_manager.py` 在每次模型请求前选取最近五轮历史，不修改 SQLite 中保存的消息。
-10. 注册并装载 `search`。输入「搜一下项目怎么启动」可以搜索本地固定说明。工具按关键词查标题和正文，无匹配时返回空列表。
-11. 用 `unittest` 覆盖直接回答、工具结果回传和模型调用上限。测试模拟模型响应，无需 API Key。在项目目录运行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`。
-12. 把固定五轮裁剪改为按长度触发的滚动摘要。低于阈值时复用已有摘要和未压缩历史，超过阈值时把新增旧轮次合并进摘要。
-13. `runtime_trace.py` 自动将工具调用和 LLM POST 尝试写入 `runtime_events`。日志在每个操作结束时提交，即使本轮回答失败仍可查询。日志只保存元数据，不写请求头、密钥、消息正文或工具参数。
+## Memory 召回与放置
 
-查看最近 20 条执行记录的 SQLite 查询如下。`step = 0` 表示摘要请求，正数表示回答循环中的第几次模型请求。
+每次提交问题时，CLI 按当前 `session_id` 从 SQLite 加载完整历史和已有摘要。召回按会话 ID 和摘要进度完成。`context_manager.py` 按以下顺序组装模型请求：
+
+1. 系统提示词。
+2. 旧历史摘要（如有），作为一条标明「仅供参考」的 assistant 消息。
+3. 尚未压缩的历史原文，包括用户问题、助手回答和成对的工具调用与结果。
+4. 当前轮的用户问题，以及本轮已产生的工具调用和结果。
+
+提问时按序列化后的 JSON 字符数估算长度。超过 12,000 字符且有旧历史可压缩时，才额外请求模型合并已有摘要与新移出的完整轮次。优先保留最近五轮原文，必要时再减少原文轮数。摘要保留事实、偏好、决定、未完成事项和重要工具结果，最多保存 2,000 字符。摘要和已覆盖消息数按会话存储，后续请求可以复用。摘要失败时沿用已有摘要和未压缩历史。SQLite 保留完整原始历史。字符阈值用于触发压缩，不能保证请求符合模型的 token 上限。
+
+## 执行日志
+
+`runtime_events` 记录模型请求和工具执行的会话、轮次、步骤、耗时及错误类型。日志只包含元数据。以下 SQL 查询最近 20 条事件，步骤 0 代表摘要请求。
 
 ```sql
 SELECT created_at, session_id, trace_id, step, event, name, tool_call_id,
        message_count, duration_ms, COALESCE(error, 'ok') AS status
 FROM runtime_events ORDER BY event_id DESC LIMIT 20;
 ```
+
+开发过程见 [AI Prompt 与问题解决记录](AI_DEVELOPMENT.md)。

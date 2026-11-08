@@ -1,6 +1,7 @@
 """最小多轮助手，支持工具调用和本地会话历史。"""
 
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -48,6 +49,9 @@ def call_llm(messages: list[dict], *, use_tools: bool = True) -> dict:
     message = result["choices"][0]["message"]
     if not isinstance(message, dict):
         raise ValueError("模型没有返回有效的消息。")
+    reasoning = message.pop("reasoning_content", None)
+    if isinstance(reasoning, str) and reasoning.strip():
+        logging.getLogger(__name__).debug("Model returned reasoning_content (%d characters)", len(reasoning))
     return message
 
 
