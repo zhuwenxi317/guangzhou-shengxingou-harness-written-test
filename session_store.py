@@ -18,6 +18,22 @@ def connect_db() -> sqlite3.Connection:
 def init_db() -> None:
     with closing(connect_db()) as db, db:
         db.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                event_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                session_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                name TEXT NOT NULL,
+                tool_call_id TEXT,
+                message_count INTEGER,
+                duration_ms REAL NOT NULL,
+                error TEXT
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS events_by_session ON runtime_events(session_id, event_id)")
+        db.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY NOT NULL,
                 messages_json TEXT NOT NULL

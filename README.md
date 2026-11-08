@@ -44,3 +44,12 @@
 10. 注册并装载 `search`。输入「搜一下项目怎么启动」可以搜索本地固定说明。工具按关键词查标题和正文，无匹配时返回空列表。
 11. 用 `unittest` 覆盖直接回答、工具结果回传和模型调用上限。测试模拟模型响应，无需 API Key。在项目目录运行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`。
 12. 把固定五轮裁剪改为按长度触发的滚动摘要。低于阈值时复用已有摘要和未压缩历史，超过阈值时把新增旧轮次合并进摘要。
+13. `runtime_trace.py` 自动将工具调用和 LLM POST 尝试写入 `runtime_events`。日志在每个操作结束时提交，即使本轮回答失败仍可查询。日志只保存元数据，不写请求头、密钥、消息正文或工具参数。
+
+查看最近 20 条执行记录的 SQLite 查询如下。`step = 0` 表示摘要请求，正数表示回答循环中的第几次模型请求。
+
+```sql
+SELECT created_at, session_id, trace_id, step, event, name, tool_call_id,
+       message_count, duration_ms, COALESCE(error, 'ok') AS status
+FROM runtime_events ORDER BY event_id DESC LIMIT 20;
+```

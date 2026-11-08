@@ -6,11 +6,13 @@ import sqlite3
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
 from agent.assistant import ASSISTANT
 from context_manager import SUMMARY_MAX_CHARS, build_context, compression_cutoff, split_history
+from runtime_trace import trace_event
 from session_store import init_db, load_messages, load_summary, save_messages, save_summary
 from tool.registry import TOOLS
 
@@ -49,7 +51,9 @@ def call_llm(messages: list[dict], *, use_tools: bool = True) -> dict:
     return message
 
 
-def refresh_summary(history: list[dict], turn: list[dict], session_id: str) -> tuple[str, int]:
+def refresh_summary(
+    history: list[dict], turn: list[dict], session_id: str, trace_id: str | None = None,
+) -> tuple[str, int]:
     summary, covered = load_summary(session_id)
     cutoff = compression_cutoff(history, turn, summary, covered)
     if cutoff <= covered:
@@ -59,7 +63,7 @@ def refresh_summary(history: list[dict], turn: list[dict], session_id: str) -> t
     start = len(system)
     data = {"previous_summary": summary, "new_old_messages": history[start + covered:start + cutoff]}
     try:
-        reply = call_llm([
+        messages = [
             {"role": "system", "content": (
                 "把已有摘要和新移出的历史消息合并成简短的中文摘要。"
                 "保留用户事实、偏好、决定、未完成事项和重要工具结果。"
@@ -67,10 +71,12 @@ def refresh_summary(history: list[dict], turn: list[dict], session_id: str) -> t
                 f"只输出摘要正文，最多 {SUMMARY_MAX_CHARS} 个字符。"
             )},
             {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
-        ], use_tools=False)
-        content = reply.get("content")
-        if not isinstance(content, str) or not content.strip() or reply.get("tool_calls"):
-            raise ValueError("摘要为空或包含工具调用")
+        ]
+        with trace_event(session_id, trace_id, 0, "llm_post", "summary", message_count=len(messages)):
+            reply = call_llm(messages, use_tools=False)
+            content = reply.get("content")
+            if not isinstance(content, str) or not content.strip() or reply.get("tool_calls"):
+                raise ValueError("摘要为空或包含工具调用")
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         print("历史摘要更新失败，本轮继续使用已有摘要和未压缩的历史。", file=sys.stderr)
         return summary, covered
@@ -80,42 +86,45 @@ def refresh_summary(history: list[dict], turn: list[dict], session_id: str) -> t
     return summary, cutoff
 
 
-def execute_tool(tool_call: dict, session_id: str) -> str:
+def execute_tool(tool_call: dict, session_id: str) -> tuple[str, str | None]:
     """按模型给出的工具名查找函数，并传入解析后的参数。"""
     function = tool_call["function"]
     registered_tool = AGENT_TOOLS.get(function["name"])
     if registered_tool is None:
-        return "错误：未知工具。"
+        return "错误：未知工具。", "unknown_tool"
     _, handler = registered_tool
 
     try:
         arguments = json.loads(function["arguments"])
     except (json.JSONDecodeError, TypeError):
-        return "错误：工具参数必须是有效的 JSON 对象。"
+        return "错误：工具参数必须是有效的 JSON 对象。", "invalid_arguments"
 
     if not isinstance(arguments, dict):
-        return "错误：工具参数必须是 JSON 对象。"
+        return "错误：工具参数必须是 JSON 对象。", "invalid_arguments"
     if "session_id" in arguments:
-        return "错误：工具参数不能指定 session_id。"
+        return "错误：工具参数不能指定 session_id。", "invalid_arguments"
 
     try:
-        return str(handler(session_id, **arguments))
+        return str(handler(session_id, **arguments)), None
     except TypeError:
-        return "错误：工具参数与函数签名不匹配。"
+        return "错误：工具参数与函数签名不匹配。", "invalid_arguments"
     except ValueError as exc:
-        return f"错误：{exc}"
+        return f"错误：{exc}", "invalid_arguments"
     except sqlite3.Error:
-        return "错误：无法读取或保存待办。"
+        return "错误：无法读取或保存待办。", "database_error"
 
 
 def run_agent(
     user_input: str, messages: list[dict], session_id: str, summary: str = "", covered: int = 0,
+    *, trace_id: str | None = None,
 ) -> str:
     # 本轮的用户消息、工具调用和工具结果先放在临时列表里。
     turn = [{"role": "user", "content": user_input}]
 
-    for _ in range(MAX_MODEL_CALLS):
-        message = call_llm(build_context(messages, turn, summary, covered))
+    for step in range(1, MAX_MODEL_CALLS + 1):
+        context = build_context(messages, turn, summary, covered)
+        with trace_event(session_id, trace_id, step, "llm_post", "answer", message_count=len(context)):
+            message = call_llm(context)
         tool_calls = message.get("tool_calls")
         content = message.get("content")
 
@@ -132,10 +141,15 @@ def run_agent(
             "tool_calls": tool_calls,
         })
         for tool_call in tool_calls:
+            with trace_event(
+                session_id, trace_id, step, "tool_call", tool_call["function"]["name"],
+                tool_call_id=tool_call["id"],
+            ) as outcome:
+                result, outcome["error"] = execute_tool(tool_call, session_id)
             turn.append({
                 "role": "tool",
                 "tool_call_id": tool_call["id"],
-                "content": execute_tool(tool_call, session_id),
+                "content": result,
             })
 
     raise ValueError("已达到本轮的模型调用上限，未获得最终回答。")
@@ -175,8 +189,9 @@ def main() -> int:
             else:
                 messages = [system_message, *(messages or [])]
             turn = [{"role": "user", "content": user_input}]
-            summary, covered = refresh_summary(messages, turn, session_id)
-            message = run_agent(user_input, messages, session_id, summary, covered)
+            trace_id = uuid4().hex
+            summary, covered = refresh_summary(messages, turn, session_id, trace_id)
+            message = run_agent(user_input, messages, session_id, summary, covered, trace_id=trace_id)
             save_messages(session_id, messages)
             print(f"助手：{message}")
         except sqlite3.Error as exc:
